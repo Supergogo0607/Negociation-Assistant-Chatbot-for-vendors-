@@ -1,7 +1,24 @@
-import { useState, useRef, useEffect } from "react";
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vinted AI Vendeur — Prototype</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #faf7f2; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useRef, useEffect } = React;
 
 // ⚙️ À MODIFIER après déploiement du Worker
-const WORKER_URL = "https://vendly.yifan6760.workers.dev/";
+const WORKER_URL = "https://vendly.yifan6760.workers.dev";
 
 const STYLES = `
   @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap');
@@ -238,7 +255,7 @@ function ReasoningCard({ analysis, expanded, onToggle }) {
   );
 }
 
-export default function VintedChatbot() {
+function VintedChatbot() {
   const [step, setStep] = useState("setup");
   const [config, setConfig] = useState({
     itemDescription: "",
@@ -700,3 +717,10 @@ const labelStyle = {
   fontSize: "12px", fontWeight: "600", color: "#555",
   letterSpacing: "0.05em", textTransform: "uppercase", display: "block",
 };
+
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<VintedChatbot />);
+  </script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 
 // ⚙️ À MODIFIER après déploiement du Worker
-const WORKER_URL = "https://votre-worker.votre-subdomain.workers.dev";
+const WORKER_URL = "https://vendly.yifan6760.workers.dev/";
 
 const STYLES = `
   @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap');

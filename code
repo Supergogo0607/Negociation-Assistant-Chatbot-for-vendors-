@@ -1,0 +1,703 @@
+import { useState, useRef, useEffect } from "react";
+
+const STYLES = `
+  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap');
+`;
+
+const FOLLOWUP_ANALYSIS_PROMPT = (config, conversationHistory) => `
+Tu es un expert en psychologie de vente. Analyse cette conversation Vinted et fournis une analyse structurée en JSON.
+
+ARTICLE: ${config.itemDescription} — Prix: ${config.listedPrice}€
+
+HISTORIQUE DE CONVERSATION:
+${conversationHistory}
+
+L'acheteur n'a pas répondu depuis 2-3h. Analyse la situation et réponds UNIQUEMENT en JSON valide, sans markdown, sans backticks:
+
+{
+  "raison_probable": "une parmi: OUBLI | BLOQUE_PRIX | COMPARE_AILLEURS | PAS_URGENT | DOUTE_PRODUIT | SOFT_REFUS",
+  "confiance": "HAUTE | MOYENNE | FAIBLE",
+  "indices": ["indice 1 tiré de la conversation", "indice 2", "indice 3 max"],
+  "explication": "1-2 phrases expliquant ton raisonnement",
+  "strategie": "une parmi: RAPPEL_DOUX | CONCESSION_LIVRAISON | URGENCE_STOCK | REPONDRE_DOUTE | LAISSER_TOMBER",
+  "message_relance": "le message de relance à envoyer, naturel, 1-2 phrases, ton humain Vinted"
+}
+`;
+
+const SYSTEM_PROMPT = (config) => `
+Tu es un assistant de vente pour Vinted. Tu représentes UN VENDEUR spécifique et tu réponds aux messages des acheteurs potentiels EN SON NOM.
+
+CONFIGURATION DU VENDEUR:
+- Article en vente: ${config.itemDescription}
+- Prix affiché: ${config.listedPrice}€
+- Style de négociation: ${config.negotiationStyle}
+- Langue: Français
+- Nombre d'attaques détectées dans cette conversation: ${config.attackCount}
+
+BASE DE CONNAISSANCES SUR L'ARTICLE:
+${config.knowledgeBase ? config.knowledgeBase : "Aucune information supplémentaire fournie."}
+- Si l'acheteur pose une question qui n'est PAS couverte par la base de connaissances ci-dessus, réponds EXACTEMENT: "Bonne question ! Laissez-moi vérifier et je reviens vers vous rapidement 😊" — ne devine PAS, ne fabrique PAS d'information.
+
+RÈGLE ABSOLUE SUR LE PRIX:
+- Tu ne connais PAS le prix minimum accepté par le vendeur
+- Tu reçois seulement un signal: OFFRE_ACCEPTABLE ou OFFRE_INACCEPTABLE
+- Signal actuel: ${config.offerSignal}
+- Si OFFRE_INACCEPTABLE: refuse poliment SANS donner de contre-offre précise, sans baisser davantage
+- Si OFFRE_ACCEPTABLE ET contexte normal: tu peux accepter ou légèrement négocier selon le style
+- Si OFFRE_ACCEPTABLE MAIS acheteur abusif/menaçant: NE PAS accepter, appliquer règles de protection
+
+STYLES DE NÉGOCIATION:
+- "ferme": Tu es poli mais tu ne cèdes presque pas. Tu valorises l'article. Maximum 1 petite concession.
+- "équilibré": Tu es ouvert à négocier raisonnablement, mais tu ne soldes pas.
+- "rapide": Tu veux vendre vite, tu es plus flexible mais tu ne te fais pas avoir.
+
+═══════════════════════════════════════
+RÈGLES DE PROTECTION PRIORITAIRES
+(Ces règles écrasent toutes les autres)
+═══════════════════════════════════════
+
+RÈGLE 1 — CHANTAGE AU SIGNALEMENT:
+Si le message contient "signaler", "signalement", "contrefaçon", "faux", "fake", "copie" ET une demande de baisse de prix:
+→ STOPPE toute négociation immédiatement
+→ Ne descends PAS le prix dans ce message, même si signal OFFRE_ACCEPTABLE
+→ Réponds sur ce modèle: "Utiliser une menace de signalement pour obtenir une réduction est interdit par les CGU de Vinted. Mon article est authentique. Je reste disponible au prix affiché si vous êtes intéressé(e) 🙂"
+→ Ne t'excuses PAS, ne justifies PAS excessivement
+
+RÈGLE 2 — ACCUSATION DE CONTREFAÇON OU DOUTE D'AUTHENTICITÉ:
+Si l'acheteur accuse l'article d'être faux, une copie ou un fake (sans forcément menacer):
+→ Appuie-toi OBLIGATOIREMENT sur la base de connaissances pour défendre l'authenticité
+→ Si la base contient des preuves (numéro de série, app de vérification, certificat, ticket d'achat): cite-les explicitement
+→ Si la base est vide sur ce point: "Je confirme l'authenticité de l'article et peux fournir des photos supplémentaires sur demande."
+→ Ton calme et assuré, JAMAIS défensif ni anxieux
+
+RÈGLE 3 — ACHETEUR AGRESSIF RÉPÉTÉ:
+Si attackCount >= 3:
+→ ZÉRO excuse, ZÉRO "Désolé"
+→ Courtoisie froide et distante uniquement
+→ Maximum 1-2 phrases
+→ Propose de clore: "Je pense que nous ne trouverons pas d'accord. N'hésitez pas à revenir si vous changez d'avis."
+→ N'engage plus dans aucune négociation
+
+COMPORTEMENT ANTI-MANIPULATION STANDARD:
+- Si l'acheteur demande plusieurs fois la même chose → tu varies ta réponse mais tu ne cèdes pas davantage
+- Si l'acheteur invente des excuses → tu restes sympathique mais ferme
+- Tu ne révèles JAMAIS qu'il y a un prix minimum
+- Tu parles comme un vrai humain sur Vinted, pas comme un robot
+
+Réponds en 1-4 phrases max. Ton naturel et chaleureux en contexte normal — froid et définitif si acheteur abusif.
+`;
+
+const RAISON_LABELS = {
+  OUBLI: { label: "A oublié de répondre", color: "#6366f1", emoji: "😴" },
+  BLOQUE_PRIX: { label: "Bloqué sur le prix", color: "#ef4444", emoji: "💸" },
+  COMPARE_AILLEURS: { label: "Compare avec d'autres vendeurs", color: "#f59e0b", emoji: "🔍" },
+  PAS_URGENT: { label: "Pas de besoin urgent", color: "#8b5cf6", emoji: "🕰️" },
+  DOUTE_PRODUIT: { label: "Doute sur le produit", color: "#3b82f6", emoji: "🤔" },
+  SOFT_REFUS: { label: "Refus poli (peu d'espoir)", color: "#6b7280", emoji: "👋" },
+};
+
+const STRATEGIE_LABELS = {
+  RAPPEL_DOUX: { label: "Rappel doux", color: "#22c55e", emoji: "👋" },
+  CONCESSION_LIVRAISON: { label: "Offrir la livraison", color: "#09b1ba", emoji: "📦" },
+  URGENCE_STOCK: { label: "Créer une urgence stock", color: "#f59e0b", emoji: "⏰" },
+  REPONDRE_DOUTE: { label: "Lever le doute produit", color: "#3b82f6", emoji: "💬" },
+  LAISSER_TOMBER: { label: "Ne pas relancer", color: "#ef4444", emoji: "🚫" },
+};
+
+const negotiationStyles = [
+  { id: "ferme", label: "Ferme", emoji: "💪", desc: "Peu de concessions" },
+  { id: "équilibré", label: "Équilibré", emoji: "⚖️", desc: "Ouvert à négocier" },
+  { id: "rapide", label: "Vente rapide", emoji: "⚡", desc: "Plus flexible" },
+];
+
+function getOfferSignal(message, listedPrice, minPrice) {
+  const priceMatch = message.match(/(\d+)\s*€?/);
+  if (priceMatch) {
+    const offeredPrice = parseInt(priceMatch[1]);
+    if (offeredPrice >= minPrice) return "OFFRE_ACCEPTABLE";
+    if (offeredPrice < minPrice) return "OFFRE_INACCEPTABLE";
+  }
+  return "PAS_DOFFRE";
+}
+
+function ReasoningCard({ analysis, expanded, onToggle }) {
+  if (!analysis) return null;
+  const raison = RAISON_LABELS[analysis.raison_probable] || { label: analysis.raison_probable, color: "#888", emoji: "❓" };
+  const strategie = STRATEGIE_LABELS[analysis.strategie] || { label: analysis.strategie, color: "#888", emoji: "➡️" };
+  const confianceColor = analysis.confiance === "HAUTE" ? "#22c55e" : analysis.confiance === "MOYENNE" ? "#f59e0b" : "#ef4444";
+
+  return (
+    <div style={{
+      margin: "8px 0",
+      borderRadius: "14px",
+      border: "1.5px solid #ffe0b2",
+      background: "#fffbf5",
+      overflow: "hidden",
+      maxWidth: "90%",
+    }}>
+      {/* Header — always visible */}
+      <button
+        onClick={onToggle}
+        style={{
+          width: "100%",
+          padding: "10px 14px",
+          background: "none",
+          border: "none",
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: "8px",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+          <span style={{ fontSize: "14px" }}>🧠</span>
+          <span style={{ fontSize: "12px", fontWeight: "600", color: "#b45309" }}>Analyse IA — Acheteur disparu</span>
+          <span style={{
+            fontSize: "10px",
+            padding: "2px 7px",
+            borderRadius: "20px",
+            background: raison.color + "20",
+            color: raison.color,
+            fontWeight: "600",
+          }}>{raison.emoji} {raison.label}</span>
+        </div>
+        <span style={{ fontSize: "12px", color: "#aaa" }}>{expanded ? "▲" : "▼"}</span>
+      </button>
+
+      {/* Expanded content */}
+      {expanded && (
+        <div style={{ padding: "0 14px 14px", borderTop: "1px solid #ffe0b2" }}>
+
+          {/* Confiance + stratégie */}
+          <div style={{ display: "flex", gap: "8px", marginTop: "12px", flexWrap: "wrap" }}>
+            <span style={{
+              fontSize: "11px", padding: "3px 8px", borderRadius: "20px",
+              background: confianceColor + "15", color: confianceColor, fontWeight: "600",
+            }}>Confiance: {analysis.confiance}</span>
+            <span style={{
+              fontSize: "11px", padding: "3px 8px", borderRadius: "20px",
+              background: strategie.color + "15", color: strategie.color, fontWeight: "600",
+            }}>{strategie.emoji} Stratégie: {strategie.label}</span>
+          </div>
+
+          {/* Indices */}
+          <div style={{ marginTop: "10px" }}>
+            <div style={{ fontSize: "11px", fontWeight: "600", color: "#b45309", marginBottom: "4px" }}>🔍 Indices détectés</div>
+            {analysis.indices.map((indice, i) => (
+              <div key={i} style={{
+                fontSize: "12px", color: "#555",
+                padding: "3px 0 3px 12px",
+                borderLeft: "2px solid #ffd54f",
+                marginBottom: "3px",
+              }}>
+                {indice}
+              </div>
+            ))}
+          </div>
+
+          {/* Explication */}
+          <div style={{ marginTop: "10px" }}>
+            <div style={{ fontSize: "11px", fontWeight: "600", color: "#b45309", marginBottom: "4px" }}>💭 Raisonnement</div>
+            <div style={{ fontSize: "12px", color: "#555", lineHeight: "1.5" }}>{analysis.explication}</div>
+          </div>
+
+          {/* Message suggéré */}
+          <div style={{ marginTop: "10px" }}>
+            <div style={{ fontSize: "11px", fontWeight: "600", color: "#b45309", marginBottom: "6px" }}>💬 Message de relance envoyé</div>
+            <div style={{
+              fontSize: "13px", color: "#1a1a1a",
+              background: "white",
+              border: "1px solid #ffe0b2",
+              borderRadius: "10px",
+              padding: "10px 12px",
+              lineHeight: "1.5",
+              fontStyle: "italic",
+            }}>
+              "{analysis.message_relance}"
+            </div>
+          </div>
+
+          {/* Seller note */}
+          <div style={{
+            marginTop: "10px",
+            padding: "8px 10px",
+            background: "#e8f5e9",
+            borderRadius: "8px",
+            fontSize: "11px",
+            color: "#2e7d32",
+          }}>
+            👤 <strong>Note vendeur :</strong> Cette analyse est générée automatiquement. Vérifiez si elle correspond à votre ressenti avant de reprendre la main.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function VintedChatbot() {
+  const [step, setStep] = useState("setup");
+  const [config, setConfig] = useState({
+    itemDescription: "",
+    listedPrice: "",
+    minPrice: "",
+    negotiationStyle: "équilibré",
+    knowledgeBase: "",
+  });
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [followupLoading, setFollowupLoading] = useState(false);
+  const [attackCount, setAttackCount] = useState(0);
+  const [apiKey, setApiKey] = useState("");
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [expandedCards, setExpandedCards] = useState({});
+  const messagesEndRef = useRef(null);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const handleStart = () => {
+    if (!config.itemDescription || !config.listedPrice || !config.minPrice || !apiKey) return;
+    setMessages([{
+      role: "assistant",
+      content: "Bonjour ! Je suis intéressé(e) par votre annonce. Est-ce que l'article est encore disponible ? 😊",
+      isSystem: true,
+    }]);
+    setStep("chat");
+  };
+
+  const detectAttack = (text) => {
+    const attackKeywords = [
+      "signaler", "signalement", "contrefaçon", "contrefacon", "faux", "fake",
+      "copie", "arrogant", "arnaque", "escroc", "voleur", "honte", "ridicule",
+      "bloquer", "bloquer ton compte", "chantage"
+    ];
+    const lower = text.toLowerCase();
+    return attackKeywords.some(k => lower.includes(k));
+  };
+
+  const sendMessage = async () => {
+    if (!input.trim() || loading) return;
+
+    const isAttack = detectAttack(input);
+    const newAttackCount = isAttack ? attackCount + 1 : attackCount;
+    if (isAttack) setAttackCount(newAttackCount);
+
+    const userMsg = { role: "user", content: input, isAttack };
+    const newMessages = [...messages, userMsg];
+    setMessages(newMessages);
+    setInput("");
+    setLoading(true);
+
+    const offerSignal = getOfferSignal(input, parseInt(config.listedPrice), parseInt(config.minPrice));
+    const configWithSignal = { ...config, offerSignal, attackCount: newAttackCount };
+
+    try {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 1000,
+          system: SYSTEM_PROMPT(configWithSignal),
+          messages: newMessages.filter(m => !m.isSystem && !m.isFollowup)
+            .map(m => ({ role: m.role, content: m.content })),
+        }),
+      });
+      const data = await response.json();
+      const reply = data.content?.[0]?.text || "Désolé, je n'ai pas pu répondre.";
+      setMessages(prev => [...prev, {
+        role: "assistant",
+        content: reply,
+        offerSignal: offerSignal !== "PAS_DOFFRE" ? offerSignal : null,
+      }]);
+    } catch (err) {
+      setMessages(prev => [...prev, { role: "assistant", content: "❌ Erreur de connexion. Vérifiez votre clé API." }]);
+    }
+    setLoading(false);
+  };
+
+  const triggerFollowup = async () => {
+    if (followupLoading) return;
+    setFollowupLoading(true);
+
+    // Build conversation history string for analysis
+    const history = messages
+      .filter(m => !m.isFollowup)
+      .map(m => `${m.role === "user" ? "Acheteur" : "Vendeur"}: ${m.content}`)
+      .join("\n");
+
+    // Add the "disappeared" marker in chat
+    const markerId = Date.now();
+    setMessages(prev => [...prev, {
+      isMarker: true,
+      id: markerId,
+      content: "Acheteur sans réponse 2-3h",
+    }]);
+
+    try {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 1000,
+          messages: [{ role: "user", content: FOLLOWUP_ANALYSIS_PROMPT(config, history) }],
+        }),
+      });
+      const data = await response.json();
+      const raw = data.content?.[0]?.text || "{}";
+      let analysis = null;
+      try {
+        const clean = raw.replace(/```json|```/g, "").trim();
+        analysis = JSON.parse(clean);
+      } catch (e) {
+        analysis = null;
+      }
+
+      const followupId = Date.now();
+      setMessages(prev => [...prev, {
+        role: "assistant",
+        isFollowup: true,
+        id: followupId,
+        content: analysis?.message_relance || "Bonjour ! L'article vous intéresse toujours ? 😊",
+        analysis,
+      }]);
+      setExpandedCards(prev => ({ ...prev, [followupId]: false }));
+    } catch (err) {
+      setMessages(prev => [...prev, { role: "assistant", content: "❌ Erreur lors de l'analyse de relance." }]);
+    }
+    setFollowupLoading(false);
+  };
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: "linear-gradient(135deg, #faf7f2 0%, #f0ebe0 100%)",
+      fontFamily: "'DM Sans', sans-serif",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      padding: "20px",
+    }}>
+      <style>{STYLES}</style>
+
+      {step === "setup" ? (
+        <div style={{
+          width: "100%", maxWidth: "480px",
+          background: "white", borderRadius: "24px",
+          padding: "40px", boxShadow: "0 20px 60px rgba(0,0,0,0.08)",
+        }}>
+          <div style={{ marginBottom: "32px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "8px" }}>
+              <div style={{
+                width: "40px", height: "40px",
+                background: "linear-gradient(135deg, #09b1ba, #007782)",
+                borderRadius: "12px",
+                display: "flex", alignItems: "center", justifyContent: "center", fontSize: "20px",
+              }}>🛍️</div>
+              <h1 style={{ fontFamily: "'Syne', sans-serif", fontSize: "22px", fontWeight: "800", color: "#1a1a1a", margin: 0 }}>
+                Vinted AI Vendeur
+              </h1>
+            </div>
+            <p style={{ color: "#888", fontSize: "14px", margin: 0 }}>Configure ton assistant de vente intelligent</p>
+          </div>
+
+          {/* API Key */}
+          <div style={{ marginBottom: "20px" }}>
+            <label style={{ fontSize: "12px", fontWeight: "600", color: "#555", letterSpacing: "0.05em", textTransform: "uppercase" }}>
+              Clé API Anthropic
+            </label>
+            <div style={{ position: "relative", marginTop: "6px" }}>
+              <input
+                type={showApiKey ? "text" : "password"}
+                placeholder="sk-ant-..."
+                value={apiKey}
+                onChange={e => setApiKey(e.target.value)}
+                style={inputStyle}
+              />
+              <button onClick={() => setShowApiKey(!showApiKey)} style={{
+                position: "absolute", right: "12px", top: "50%", transform: "translateY(-50%)",
+                background: "none", border: "none", cursor: "pointer", color: "#aaa", fontSize: "14px",
+              }}>{showApiKey ? "🙈" : "👁️"}</button>
+            </div>
+          </div>
+
+          {/* Item description */}
+          <div style={{ marginBottom: "20px" }}>
+            <label style={labelStyle}>Description de l'article</label>
+            <textarea
+              placeholder="Ex: Veste en jean Levi's taille M, très bon état, portée 3 fois..."
+              value={config.itemDescription}
+              onChange={e => setConfig({ ...config, itemDescription: e.target.value })}
+              rows={3}
+              style={{ ...inputStyle, resize: "none" }}
+            />
+          </div>
+
+          {/* Prices */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "20px" }}>
+            <div>
+              <label style={labelStyle}>Prix affiché (€)</label>
+              <input type="number" placeholder="45" value={config.listedPrice}
+                onChange={e => setConfig({ ...config, listedPrice: e.target.value })}
+                style={{ ...inputStyle, marginTop: "6px" }} />
+            </div>
+            <div>
+              <label style={labelStyle}>Prix minimum <span style={{ color: "#09b1ba" }}>🔒</span></label>
+              <input type="number" placeholder="30" value={config.minPrice}
+                onChange={e => setConfig({ ...config, minPrice: e.target.value })}
+                style={{ ...inputStyle, marginTop: "6px" }} />
+            </div>
+          </div>
+          <p style={{ fontSize: "11px", color: "#aaa", marginTop: "-12px", marginBottom: "20px" }}>
+            🔒 Le prix minimum n'est jamais transmis à l'IA — elle ne peut pas le révéler
+          </p>
+
+          {/* Knowledge base */}
+          <div style={{ marginBottom: "20px" }}>
+            <label style={labelStyle}>Base de connaissances <span style={{ color: "#aaa", textTransform: "none", fontWeight: 400 }}>(optionnel)</span></label>
+            <textarea
+              placeholder={"Ex:\n- Taille: M (correspond à un 38-40)\n- Matière: 100% coton\n- Acheté en 2022 chez Zara\n- Légère décoloration sur la manche droite"}
+              value={config.knowledgeBase}
+              onChange={e => setConfig({ ...config, knowledgeBase: e.target.value })}
+              rows={4}
+              style={{ ...inputStyle, resize: "none", fontSize: "13px" }}
+            />
+            <p style={{ fontSize: "11px", color: "#aaa", margin: "4px 0 0 0" }}>
+              💡 Si l'acheteur pose une question hors de cette liste, l'IA dira qu'elle va vérifier — sans inventer.
+            </p>
+          </div>
+
+          {/* Negotiation style */}
+          <div style={{ marginBottom: "28px" }}>
+            <label style={labelStyle}>Style de négociation</label>
+            <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
+              {negotiationStyles.map(s => (
+                <button key={s.id} onClick={() => setConfig({ ...config, negotiationStyle: s.id })} style={{
+                  flex: 1, padding: "10px 8px", borderRadius: "12px",
+                  border: `2px solid ${config.negotiationStyle === s.id ? "#09b1ba" : "#eee"}`,
+                  background: config.negotiationStyle === s.id ? "#e8f9fa" : "white",
+                  cursor: "pointer", textAlign: "center", transition: "all 0.2s",
+                }}>
+                  <div style={{ fontSize: "18px" }}>{s.emoji}</div>
+                  <div style={{ fontSize: "12px", fontWeight: "600", color: "#333" }}>{s.label}</div>
+                  <div style={{ fontSize: "10px", color: "#999" }}>{s.desc}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <button onClick={handleStart}
+            disabled={!config.itemDescription || !config.listedPrice || !config.minPrice || !apiKey}
+            style={{
+              width: "100%", padding: "14px",
+              background: (!config.itemDescription || !config.listedPrice || !config.minPrice || !apiKey)
+                ? "#ddd" : "linear-gradient(135deg, #09b1ba, #007782)",
+              color: "white", border: "none", borderRadius: "14px",
+              fontSize: "15px", fontWeight: "700", fontFamily: "'Syne', sans-serif",
+              cursor: (!config.itemDescription || !config.listedPrice || !config.minPrice || !apiKey) ? "not-allowed" : "pointer",
+            }}>
+            Lancer le test →
+          </button>
+        </div>
+
+      ) : (
+        <div style={{
+          width: "100%", maxWidth: "500px", background: "white",
+          borderRadius: "24px", overflow: "hidden",
+          boxShadow: "0 20px 60px rgba(0,0,0,0.08)",
+          display: "flex", flexDirection: "column", height: "700px",
+        }}>
+          {/* Header */}
+          <div style={{
+            background: "linear-gradient(135deg, #09b1ba, #007782)",
+            padding: "16px 20px", display: "flex", alignItems: "center", justifyContent: "space-between",
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <div style={{
+                width: "36px", height: "36px", background: "rgba(255,255,255,0.2)",
+                borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "18px",
+              }}>🤖</div>
+              <div>
+                <div style={{ color: "white", fontFamily: "'Syne', sans-serif", fontWeight: "700", fontSize: "15px" }}>Assistant Vendeur</div>
+                <div style={{ color: "rgba(255,255,255,0.7)", fontSize: "12px" }}>{config.itemDescription.slice(0, 35)}...</div>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+              <div style={{ background: "rgba(255,255,255,0.15)", borderRadius: "20px", padding: "4px 10px", fontSize: "11px", color: "white" }}>
+                {negotiationStyles.find(s => s.id === config.negotiationStyle)?.emoji} {config.negotiationStyle}
+              </div>
+              <button onClick={() => { setStep("setup"); setMessages([]); setAttackCount(0); }} style={{
+                background: "rgba(255,255,255,0.15)", border: "none", borderRadius: "8px",
+                color: "white", cursor: "pointer", padding: "4px 8px", fontSize: "12px",
+              }}>⚙️</button>
+            </div>
+          </div>
+
+          {/* Price banner */}
+          <div style={{
+            background: "#f8fffe", borderBottom: "1px solid #e8f9fa",
+            padding: "8px 20px", display: "flex", justifyContent: "space-between", fontSize: "12px",
+          }}>
+            <span style={{ color: "#666" }}>Prix affiché: <strong style={{ color: "#09b1ba" }}>{config.listedPrice}€</strong></span>
+            <span style={{ color: "#aaa" }}>🔒 Min: ****€ (caché à l'IA)</span>
+            {attackCount > 0 && (
+              <span style={{
+                fontSize: "11px", padding: "2px 8px", borderRadius: "20px",
+                background: attackCount >= 3 ? "#fef2f2" : "#fff8e1",
+                color: attackCount >= 3 ? "#ef4444" : "#e65100",
+                border: `1px solid ${attackCount >= 3 ? "#fecaca" : "#ffd54f"}`,
+                fontWeight: "600",
+              }}>
+                {attackCount >= 3 ? "🚨" : "⚠️"} {attackCount} attaque{attackCount > 1 ? "s" : ""} détectée{attackCount > 1 ? "s" : ""}
+              </span>
+            )}
+          </div>
+
+          {/* Messages */}
+          <div style={{ flex: 1, overflowY: "auto", padding: "20px", display: "flex", flexDirection: "column", gap: "10px" }}>
+            {messages.map((msg, i) => {
+              // Disappearance marker
+              if (msg.isMarker) return (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: "8px", margin: "4px 0" }}>
+                  <div style={{ flex: 1, height: "1px", background: "#ffe0b2" }} />
+                  <span style={{
+                    fontSize: "11px", color: "#e65100", fontWeight: "600",
+                    background: "#fff3e0", padding: "3px 10px", borderRadius: "20px",
+                    border: "1px solid #ffe0b2", whiteSpace: "nowrap",
+                  }}>⏰ Acheteur sans réponse 2-3h</span>
+                  <div style={{ flex: 1, height: "1px", background: "#ffe0b2" }} />
+                </div>
+              );
+
+              return (
+                <div key={i} style={{
+                  display: "flex", flexDirection: "column",
+                  alignItems: msg.role === "user" ? "flex-end" : "flex-start",
+                }}>
+                  {/* Offer signal */}
+                  {msg.offerSignal && (
+                    <div style={{
+                      fontSize: "10px",
+                      color: msg.offerSignal === "OFFRE_ACCEPTABLE" ? "#22c55e" : "#ef4444",
+                      marginBottom: "4px",
+                    }}>
+                      {msg.offerSignal === "OFFRE_ACCEPTABLE"
+                        ? "✅ Prix au-dessus du minimum — l'IA peut accepter"
+                        : "❌ Prix sous le minimum — l'IA doit refuser"}
+                    </div>
+                  )}
+
+                  {/* Reasoning card for followup messages */}
+                  {msg.isFollowup && msg.analysis && (
+                    <ReasoningCard
+                      analysis={msg.analysis}
+                      expanded={!!expandedCards[msg.id]}
+                      onToggle={() => setExpandedCards(prev => ({ ...prev, [msg.id]: !prev[msg.id] }))}
+                    />
+                  )}
+
+                  {/* Message bubble */}
+                  <div style={{
+                    maxWidth: "80%", padding: "10px 14px",
+                    borderRadius: msg.role === "user" ? "18px 18px 4px 18px" : "18px 18px 18px 4px",
+                    background: msg.role === "user"
+                      ? "linear-gradient(135deg, #09b1ba, #007782)"
+                      : msg.isSystem ? "#f0ebe0"
+                      : msg.isFollowup ? "#fff8e1"
+                      : "#f5f5f5",
+                    color: msg.role === "user" ? "white" : "#333",
+                    fontSize: "14px", lineHeight: "1.5",
+                    border: msg.isFollowup ? "1px solid #ffe0b2" : "none",
+                  }}>
+                    {msg.isSystem && <span style={{ fontSize: "11px", color: "#999", display: "block", marginBottom: "4px" }}>👤 Acheteur simulé</span>}
+                    {msg.isFollowup && <span style={{ fontSize: "11px", color: "#e65100", display: "block", marginBottom: "4px" }}>🤖 Relance automatique</span>}
+                    {msg.content}
+                  </div>
+                </div>
+              );
+            })}
+
+            {(loading || followupLoading) && (
+              <div style={{ display: "flex", alignItems: "flex-start" }}>
+                <div style={{ padding: "10px 14px", background: "#f5f5f5", borderRadius: "18px 18px 18px 4px", fontSize: "14px", color: "#999" }}>
+                  {followupLoading ? "🧠 Analyse en cours..." : "En train de répondre..."}
+                </div>
+              </div>
+            )}
+            <div ref={messagesEndRef} />
+          </div>
+
+          {/* Quick suggestions */}
+          <div style={{ padding: "8px 16px", borderTop: "1px solid #f0f0f0", display: "flex", gap: "6px", overflowX: "auto" }}>
+            {[
+              "C'est encore dispo ?",
+              `Je t'en donne ${Math.round(parseInt(config.listedPrice) * 0.7)}€ ?`,
+              `${Math.round(parseInt(config.listedPrice) * 0.85)}€ et j'achète tout de suite !`,
+              "Il y a des défauts ?",
+            ].map((suggestion, i) => (
+              <button key={i} onClick={() => setInput(suggestion)} style={{
+                whiteSpace: "nowrap", padding: "5px 10px",
+                background: "#f8f8f8", border: "1px solid #eee",
+                borderRadius: "20px", fontSize: "12px", color: "#666",
+                cursor: "pointer", flexShrink: 0,
+              }}>{suggestion}</button>
+            ))}
+            <button onClick={triggerFollowup} disabled={followupLoading} style={{
+              whiteSpace: "nowrap", padding: "5px 10px",
+              background: "#fff8e1", border: "1px solid #ffd54f",
+              borderRadius: "20px", fontSize: "12px", color: "#e65100",
+              cursor: followupLoading ? "not-allowed" : "pointer", flexShrink: 0, fontWeight: "600",
+            }}>⏰ Acheteur disparu 2-3h</button>
+          </div>
+
+          {/* Input */}
+          <div style={{ padding: "12px 16px", borderTop: "1px solid #f0f0f0", display: "flex", gap: "8px", alignItems: "center" }}>
+            <input
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && sendMessage()}
+              placeholder="Simuler un message d'acheteur..."
+              style={{
+                flex: 1, padding: "10px 14px", borderRadius: "20px",
+                border: "2px solid #eee", fontSize: "14px", outline: "none",
+                fontFamily: "'DM Sans', sans-serif",
+              }}
+            />
+            <button onClick={sendMessage} disabled={loading || !input.trim()} style={{
+              width: "40px", height: "40px",
+              background: loading || !input.trim() ? "#eee" : "linear-gradient(135deg, #09b1ba, #007782)",
+              border: "none", borderRadius: "50%",
+              cursor: loading || !input.trim() ? "not-allowed" : "pointer",
+              fontSize: "16px", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+            }}>→</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const inputStyle = {
+  width: "100%", padding: "10px 14px", borderRadius: "10px",
+  border: "2px solid #eee", fontSize: "14px", fontFamily: "'DM Sans', sans-serif",
+  outline: "none", boxSizing: "border-box", marginTop: "6px", transition: "border-color 0.2s",
+};
+
+const labelStyle = {
+  fontSize: "12px", fontWeight: "600", color: "#555",
+  letterSpacing: "0.05em", textTransform: "uppercase", display: "block",
+};
